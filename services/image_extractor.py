@@ -27,7 +27,6 @@ def extract_image_data(url: str):
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--single-process",
                     "--disable-blink-features=AutomationControlled"
                 ]
             )
@@ -56,7 +55,8 @@ def extract_image_data(url: str):
                 logger.warning(f"Goto timed out, attempting to extract anyway: {e}")
             
             # Scroll down to the bottom of the page in steps to trigger lazy loading
-            page.evaluate("""async () => {
+            # (Wrapped in an IIFE () so it actually executes)
+            page.evaluate("""(async () => {
                 await new Promise((resolve) => {
                     let totalHeight = 0;
                     const distance = 100;
@@ -71,7 +71,7 @@ def extract_image_data(url: str):
                         }
                     }, 50);
                 });
-            }""")
+            })()""")
             page.wait_for_timeout(2000)
             
             # Scroll back to top

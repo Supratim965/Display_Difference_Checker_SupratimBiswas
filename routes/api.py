@@ -7,6 +7,40 @@ from services.logger import logger
 
 api_bp = Blueprint('api', __name__)
 
+@api_bp.route('/debug', methods=['GET'])
+def debug():
+    """Diagnostic endpoint to test Playwright on the server."""
+    import sys, platform
+    result = {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "playwright_test": None,
+        "error": None
+    }
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage", "--disable-gpu", "--single-process"]
+            )
+            page = browser.new_page()
+            page.goto("https://example.com", wait_until="domcontentloaded", timeout=30000)
+            title = page.title()
+            content = page.content()
+            img_count = page.evaluate("document.querySelectorAll('img').length")
+            browser.close()
+            result["playwright_test"] = {
+                "success": True,
+                "page_title": title,
+                "html_length": len(content),
+                "img_count": img_count
+            }
+    except Exception as e:
+        result["error"] = str(e)
+    return jsonify(result)
+
 @api_bp.route('/analyze', methods=['POST'])
 def analyze_url():
     data = request.get_json()

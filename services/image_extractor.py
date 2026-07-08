@@ -68,9 +68,17 @@ def extract_image_data(url: str):
                 const imgs = document.querySelectorAll('img');
                 
                 imgs.forEach(img => {
-                    // Try to determine src
-                    let src = img.currentSrc || img.src || img.getAttribute('src');
-                    if (!src) return;
+                    // Try ALL possible src attributes (handles lazy loading patterns)
+                    let src = img.currentSrc 
+                           || img.src 
+                           || img.getAttribute('src')
+                           || img.getAttribute('data-src')
+                           || img.getAttribute('data-lazy-src')
+                           || img.getAttribute('data-original')
+                           || img.getAttribute('data-lazy')
+                           || img.getAttribute('data-url')
+                           || img.getAttribute('data-image');
+                    if (!src || src === window.location.href) return;
                     
                     if (src.startsWith('data:image') || src.startsWith('blob:')) {
                         return;

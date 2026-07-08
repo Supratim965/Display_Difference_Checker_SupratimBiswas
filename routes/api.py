@@ -11,9 +11,11 @@ api_bp = Blueprint('api', __name__)
 def debug():
     """Diagnostic endpoint to test Playwright on the server."""
     import sys, platform
+    test_url = request.args.get('url', 'https://example.com')
     result = {
         "python": sys.version,
         "platform": platform.platform(),
+        "test_url": test_url,
         "playwright_test": None,
         "error": None
     }
@@ -23,19 +25,28 @@ def debug():
             browser = p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-setuid-sandbox",
-                      "--disable-dev-shm-usage", "--disable-gpu", "--single-process"]
+                      "--disable-dev-shm-usage", "--disable-gpu", "--single-process",
+                      "--disable-blink-features=AutomationControlled"]
             )
-            page = browser.new_page()
-            page.goto("https://example.com", wait_until="domcontentloaded", timeout=30000)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = context.new_page()
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            page.goto(test_url, wait_until="domcontentloaded", timeout=60000)
             title = page.title()
-            content = page.content()
+            html = page.content()
             img_count = page.evaluate("document.querySelectorAll('img').length")
+            # Get first 2000 chars of HTML to see what the server actually returned
+            html_snippet = html[:2000]
             browser.close()
             result["playwright_test"] = {
                 "success": True,
                 "page_title": title,
-                "html_length": len(content),
-                "img_count": img_count
+                "html_length": len(html),
+                "img_count": img_count,
+                "html_snippet": html_snippet
             }
     except Exception as e:
         result["error"] = str(e)

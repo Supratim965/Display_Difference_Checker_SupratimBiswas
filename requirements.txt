@@ -1,5 +1,6 @@
-Flask
-playwright
-openpyxl
-requests
-gunicorn
+Flask==3.0.3
+playwright==1.44.0
+openpyxl==3.1.2
+requests==2.31.0
+Pillow==10.3.0
+gunicorn==21.2.0

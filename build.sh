@@ -6,6 +6,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # Install Chromium inside the project directory so it persists on Render
-# (Render's cache dir gets wiped between build and runtime containers)
+# Note: --with-deps requires root which is not available on Render free tier
+# Render's base Ubuntu image already has the required Chromium OS libraries
 export PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/playwright-browsers
-playwright install chromium --with-deps
+playwright install chromium

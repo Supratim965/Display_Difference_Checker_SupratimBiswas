@@ -133,24 +133,57 @@ def extract_image_data(url: str):
                 
                 await Promise.all(promises);
                 
-                // Process all source elements in picture tags
-                document.querySelectorAll('source').forEach(source => {
-                    let src = source.getAttribute('srcset') || source.getAttribute('src');
-                    if (!src) return;
+                // Process all <source> elements (async so we can background-load for original dims)
+                const sourcesPromises = Array.from(document.querySelectorAll('source')).map(async (source) => {
+                    // srcset may contain multiple comma-separated candidates — take the first URL only
+                    let srcRaw = source.getAttribute('srcset') || source.getAttribute('src');
+                    if (!srcRaw) return;
                     
-                    src = src.split(' ')[0];
-                    if (src.startsWith('data:') || src.startsWith('blob:')) return;
+                    let src = srcRaw.split(',')[0].trim().split(/\\s+/)[0];
+                    if (!src || src.startsWith('data:') || src.startsWith('blob:')) return;
                     
                     try { src = new URL(src, window.location.href).href; } catch(e) { return; }
+                    
+                    // --- Displayed dimensions ---
+                    // <source> has no layout box; use the sibling <img> inside the same <picture> instead.
+                    let dispW = null;
+                    let dispH = null;
+                    const parent = source.parentElement;
+                    if (parent && parent.tagName.toLowerCase() === 'picture') {
+                        const siblingImg = parent.querySelector('img');
+                        if (siblingImg) {
+                            const sw = siblingImg.width || siblingImg.clientWidth || siblingImg.offsetWidth;
+                            const sh = siblingImg.height || siblingImg.clientHeight || siblingImg.offsetHeight;
+                            // Only store if non-zero; leave null when the sibling is also unrendered
+                            if (sw > 0) dispW = sw;
+                            if (sh > 0) dispH = sh;
+                        }
+                    }
+                    
+                    // --- Original (intrinsic) dimensions ---
+                    // Load the image URL in a temporary off-DOM Image() to read naturalWidth/naturalHeight.
+                    let origW = null;
+                    let origH = null;
+                    const dims = await new Promise(resolve => {
+                        const tempImg = new Image();
+                        tempImg.onload  = () => resolve({ w: tempImg.naturalWidth, h: tempImg.naturalHeight });
+                        tempImg.onerror = () => resolve({ w: null, h: null });
+                        tempImg.src = src;
+                        // 8-second safety timeout so a stalled request doesn't block everything
+                        setTimeout(() => resolve({ w: null, h: null }), 8000);
+                    });
+                    if (dims.w && dims.w > 0) origW = dims.w;
+                    if (dims.h && dims.h > 0) origH = dims.h;
                     
                     results.push({
                         tag: '<source>',
                         src: src,
                         alt: null,
-                        displayedWidth: 0,
-                        displayedHeight: 0,
-                        originalWidth: 0,
-                        originalHeight: 0,
+                        // null means "could not determine" — Python will write "N/A" to Excel
+                        displayedWidth: dispW,
+                        displayedHeight: dispH,
+                        originalWidth: origW,
+                        originalHeight: origH,
                         loadingAttribute: '',
                         fetchpriority: '',
                         decoding: '',
@@ -159,9 +192,11 @@ def extract_image_data(url: str):
                         missingWHAttributes: true,
                         lazyLoaded: false,
                         responsive: true,
-                        broken: false
+                        broken: (origW === null && origH === null)
                     });
                 });
+                
+                await Promise.all(sourcesPromises);
                 
                 return results;
             }""")
@@ -207,19 +242,19 @@ def extract_image_data(url: str):
                     results["jpeg"] += 1
                 
                 # Compute display difference
-                w = img['displayedWidth']
-                h = img['displayedHeight']
+                # w/h/nw/nh may be None for <source> elements where the dimension is unknown
+                w  = img['displayedWidth']
+                h  = img['displayedHeight']
                 nw = img['originalWidth']
                 nh = img['originalHeight']
                 
-                w_diff = 0
-                h_diff = 0
-                if nw > 0:
-                    w_diff = ((nw - w) / nw) * 100
-                if nh > 0:
-                    h_diff = ((nh - h) / nh) * 100
-                    
-                display_diff_str = f"W: {w_diff:.2f}%\nH: {h_diff:.2f}%"
+                # Only calculate percentage diffs when both displayed and original are real numbers
+                def _num(v):
+                    return isinstance(v, (int, float))
+                
+                w_diff_str = f"{((nw - w) / nw) * 100:.2f}%" if _num(w) and _num(nw) and nw > 0 else "N/A"
+                h_diff_str = f"{((nh - h) / nh) * 100:.2f}%" if _num(h) and _num(nh) and nh > 0 else "N/A"
+                display_diff_str = f"W: {w_diff_str}\nH: {h_diff_str}"
                 
                 img['displayDifference'] = display_diff_str
                 img['extension'] = ext
@@ -227,10 +262,19 @@ def extract_image_data(url: str):
                 img['duplicate'] = src in seen_urls
                 seen_urls.add(src)
                 
+                # Replace None with "N/A" for the Excel columns — never write 0 for unknown dims
+                img['displayedWidth']  = w  if w  is not None else "N/A"
+                img['displayedHeight'] = h  if h  is not None else "N/A"
+                img['originalWidth']   = nw if nw is not None else "N/A"
+                img['originalHeight']  = nh if nh is not None else "N/A"
+                
                 img['missingAlt'] = img['alt'] is None
-                img['zeroDimensions'] = (w == 0 and h == 0)
-                img['upscaled'] = (w > nw and nw > 0) or (h > nh and nh > 0)
-                img['downscaled'] = (w < nw and w > 0) or (h < nh and h > 0)
+                # zeroDimensions only when we have real numbers and both are 0
+                img['zeroDimensions'] = (_num(w) and w == 0 and _num(h) and h == 0)
+                img['upscaled']   = (_num(w) and _num(nw) and w > nw and nw > 0) or \
+                                    (_num(h) and _num(nh) and h > nh and nh > 0)
+                img['downscaled'] = (_num(w) and _num(nw) and w < nw and w > 0) or \
+                                    (_num(h) and _num(nh) and h < nh and h > 0)
                 img['src'] = src
                 
                 processed_images.append(img)

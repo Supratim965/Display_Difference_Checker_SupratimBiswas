@@ -78,12 +78,12 @@ def extract_image_data(url: str):
             page.evaluate("window.scrollTo(0, 0)")
             page.wait_for_timeout(1000)
             
-            # Extract all image metadata from the page
-            images_data = page.evaluate("""() => {
+            # Extract all image metadata from the page using hybrid async loading for hidden/lazy images
+            images_data = page.evaluate("""async () => {
                 const results = [];
+                const imgs = document.querySelectorAll('img');
                 
-                // Process all img elements
-                document.querySelectorAll('img').forEach(img => {
+                const promises = Array.from(imgs).map(async (img) => {
                     let src = img.currentSrc || img.src 
                            || img.getAttribute('src')
                            || img.getAttribute('data-src')
@@ -100,14 +100,34 @@ def extract_image_data(url: str):
                         tag = '<picture>';
                     }
                     
+                    let dispW = img.width || img.clientWidth || img.offsetWidth || 0;
+                    let dispH = img.height || img.clientHeight || img.offsetHeight || 0;
+                    
+                    let origW = img.naturalWidth || 0;
+                    let origH = img.naturalHeight || 0;
+                    
+                    // If original dimensions are 0 (lazy loaded or hidden), load in background to measure
+                    if (origW === 0 || origH === 0) {
+                        const dims = await new Promise(resolve => {
+                            const tempImg = new Image();
+                            tempImg.onload = () => resolve({ w: tempImg.naturalWidth, h: tempImg.naturalHeight });
+                            tempImg.onerror = () => resolve({ w: 0, h: 0 });
+                            tempImg.src = src;
+                            // 5s timeout
+                            setTimeout(() => resolve({ w: 0, h: 0 }), 5000);
+                        });
+                        origW = dims.w;
+                        origH = dims.h;
+                    }
+                    
                     results.push({
                         tag: tag,
                         src: src,
                         alt: img.getAttribute('alt'),
-                        displayedWidth: img.width || img.clientWidth || img.offsetWidth || 0,
-                        displayedHeight: img.height || img.clientHeight || img.offsetHeight || 0,
-                        originalWidth: img.naturalWidth || 0,
-                        originalHeight: img.naturalHeight || 0,
+                        displayedWidth: dispW,
+                        displayedHeight: dispH,
+                        originalWidth: origW,
+                        originalHeight: origH,
                         loadingAttribute: img.getAttribute('loading') || '',
                         fetchpriority: img.getAttribute('fetchpriority') || '',
                         decoding: img.getAttribute('decoding') || '',
@@ -116,9 +136,11 @@ def extract_image_data(url: str):
                         missingWHAttributes: (!img.getAttribute('width') || !img.getAttribute('height')),
                         lazyLoaded: (img.getAttribute('loading') === 'lazy'),
                         responsive: !!(img.getAttribute('srcset') || img.getAttribute('sizes')),
-                        broken: (img.naturalWidth === 0 && img.naturalHeight === 0)
+                        broken: (origW === 0 && origH === 0)
                     });
                 });
+                
+                await Promise.all(promises);
                 
                 // Process all source elements in picture tags
                 document.querySelectorAll('source').forEach(source => {

@@ -55,11 +55,51 @@ def extract_image_data(url: str):
             except Exception as e:
                 logger.warning(f"Goto timed out or had an issue, but attempting to extract anyway: {e}")
             
-            # Inject a script to scroll down slightly or completely to trigger lazy loads?
+            # Step 1: Scroll the entire page to trigger lazy-load observers
             page.evaluate("""
                 window.scrollTo(0, document.body.scrollHeight);
             """)
-            page.wait_for_timeout(2000) # give it a moment
+            page.wait_for_timeout(1000)
+            page.evaluate("""
+                window.scrollTo(0, 0);
+            """)
+            page.wait_for_timeout(500)
+            
+            # Step 2: Force all lazy-loaded images to load by copying data-src to src
+            page.evaluate("""() => {
+                const imgs = document.querySelectorAll('img');
+                imgs.forEach(img => {
+                    const lazySrc = img.getAttribute('data-src') 
+                                 || img.getAttribute('data-lazy-src')
+                                 || img.getAttribute('data-original')
+                                 || img.getAttribute('data-lazy')
+                                 || img.getAttribute('data-url')
+                                 || img.getAttribute('data-image');
+                    if (lazySrc && (!img.src || img.src === window.location.href)) {
+                        img.src = lazySrc;
+                    }
+                    // Also remove loading="lazy" to force immediate load
+                    img.removeAttribute('loading');
+                });
+            }""")
+            
+            # Step 3: Wait for all images to finish loading
+            page.evaluate("""() => {
+                return Promise.all(
+                    Array.from(document.querySelectorAll('img'))
+                        .filter(img => img.src && !img.src.startsWith('data:'))
+                        .map(img => {
+                            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+                            return new Promise(resolve => {
+                                img.onload = resolve;
+                                img.onerror = resolve;
+                                // Safety timeout per image
+                                setTimeout(resolve, 5000);
+                            });
+                        })
+                );
+            }""")
+            page.wait_for_timeout(1000)
             
             # Extract data using browser JS
             images_data = page.evaluate("""() => {

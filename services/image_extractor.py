@@ -15,7 +15,7 @@ def extract_image_data(url: str):
         "images": []
     }
     
-    # Allowed extensions (including JPEG/JPG as per user request)
+    # Allowed extensions
     allowed_exts = [".png", ".svg", ".jpg", ".jpeg"]
     
     with sync_playwright() as p:
@@ -49,105 +49,65 @@ def extract_image_data(url: str):
             # Remove the webdriver flag to avoid bot detection
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
-            # Go to URL and wait for DOMContentLoaded (fastest)
+            # Go to URL and wait for page load
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                page.goto(url, wait_until="load", timeout=90000)
             except Exception as e:
-                logger.warning(f"Goto timed out or had an issue, but attempting to extract anyway: {e}")
+                logger.warning(f"Goto timed out, attempting to extract anyway: {e}")
             
-            # Step 1: Scroll the entire page to trigger lazy-load observers
-            page.evaluate("""
-                window.scrollTo(0, document.body.scrollHeight);
-            """)
-            page.wait_for_timeout(1000)
-            page.evaluate("""
-                window.scrollTo(0, 0);
-            """)
-            page.wait_for_timeout(500)
-            
-            # Step 2: Force all lazy-loaded images to load by copying data-src to src
-            page.evaluate("""() => {
-                const imgs = document.querySelectorAll('img');
-                imgs.forEach(img => {
-                    const lazySrc = img.getAttribute('data-src') 
-                                 || img.getAttribute('data-lazy-src')
-                                 || img.getAttribute('data-original')
-                                 || img.getAttribute('data-lazy')
-                                 || img.getAttribute('data-url')
-                                 || img.getAttribute('data-image');
-                    if (lazySrc && (!img.src || img.src === window.location.href)) {
-                        img.src = lazySrc;
-                    }
-                    // Also remove loading="lazy" to force immediate load
-                    img.removeAttribute('loading');
+            # Scroll down to the bottom of the page in steps to trigger lazy loading
+            page.evaluate("""async () => {
+                await new Promise((resolve) => {
+                    let totalHeight = 0;
+                    const distance = 100;
+                    const timer = setInterval(() => {
+                        const scrollHeight = document.body.scrollHeight;
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+                        
+                        if (totalHeight >= scrollHeight || totalHeight > 20000) {
+                            clearInterval(timer);
+                            resolve();
+                        }
+                    }, 50);
                 });
             }""")
+            page.wait_for_timeout(2000)
             
-            # Step 3: Wait for all images to finish loading
-            page.evaluate("""() => {
-                return Promise.all(
-                    Array.from(document.querySelectorAll('img'))
-                        .filter(img => img.src && !img.src.startsWith('data:'))
-                        .map(img => {
-                            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-                            return new Promise(resolve => {
-                                img.onload = resolve;
-                                img.onerror = resolve;
-                                // Safety timeout per image
-                                setTimeout(resolve, 5000);
-                            });
-                        })
-                );
-            }""")
+            # Scroll back to top
+            page.evaluate("window.scrollTo(0, 0)")
             page.wait_for_timeout(1000)
             
-            # Extract data using browser JS
+            # Extract all image metadata from the page
             images_data = page.evaluate("""() => {
                 const results = [];
-                // Find all img tags
-                const imgs = document.querySelectorAll('img');
                 
-                imgs.forEach(img => {
-                    // Try ALL possible src attributes (handles lazy loading patterns)
-                    let src = img.currentSrc 
-                           || img.src 
+                // Process all img elements
+                document.querySelectorAll('img').forEach(img => {
+                    let src = img.currentSrc || img.src 
                            || img.getAttribute('src')
                            || img.getAttribute('data-src')
                            || img.getAttribute('data-lazy-src')
-                           || img.getAttribute('data-original')
-                           || img.getAttribute('data-lazy')
-                           || img.getAttribute('data-url')
-                           || img.getAttribute('data-image');
+                           || img.getAttribute('data-original');
+                           
                     if (!src || src === window.location.href) return;
+                    if (src.startsWith('data:') || src.startsWith('blob:')) return;
                     
-                    if (src.startsWith('data:image') || src.startsWith('blob:')) {
-                        return;
-                    }
+                    try { src = new URL(src, window.location.href).href; } catch(e) { return; }
                     
                     let tag = '<img>';
                     if (img.parentElement && img.parentElement.tagName.toLowerCase() === 'picture') {
                         tag = '<picture>';
                     }
                     
-                    // Dimensions
-                    let width = img.width || img.clientWidth || 0;
-                    let height = img.height || img.clientHeight || 0;
-                    let naturalWidth = img.naturalWidth || 0;
-                    let naturalHeight = img.naturalHeight || 0;
-                    
-                    let broken = false;
-                    if (naturalWidth === 0 || naturalHeight === 0) {
-                        broken = true;
-                    }
-                    
                     results.push({
                         tag: tag,
                         src: src,
-                        alt: img.getAttribute('alt') !== null ? img.getAttribute('alt') : null,
-                        displayedWidth: width,
-                        displayedHeight: height,
-                        originalWidth: naturalWidth,
-                        originalHeight: naturalHeight,
+                        alt: img.getAttribute('alt'),
+                        displayedWidth: img.width || img.clientWidth || img.offsetWidth || 0,
+                        displayedHeight: img.height || img.clientHeight || img.offsetHeight || 0,
+                        originalWidth: img.naturalWidth || 0,
+                        originalHeight: img.naturalHeight || 0,
                         loadingAttribute: img.getAttribute('loading') || '',
                         fetchpriority: img.getAttribute('fetchpriority') || '',
                         decoding: img.getAttribute('decoding') || '',
@@ -155,29 +115,26 @@ def extract_image_data(url: str):
                         referrerpolicy: img.getAttribute('referrerpolicy') || '',
                         missingWHAttributes: (!img.getAttribute('width') || !img.getAttribute('height')),
                         lazyLoaded: (img.getAttribute('loading') === 'lazy'),
-                        responsive: (img.getAttribute('srcset') || img.getAttribute('sizes')) ? true : false,
-                        broken: broken
+                        responsive: !!(img.getAttribute('srcset') || img.getAttribute('sizes')),
+                        broken: (img.naturalWidth === 0 && img.naturalHeight === 0)
                     });
                 });
                 
-                // Now handle sources in picture that didn't have an img fallback maybe? 
-                // Mostly covered by img.currentSrc, but let's check <source> tags directly
-                const sources = document.querySelectorAll('source');
-                sources.forEach(source => {
+                // Process all source elements in picture tags
+                document.querySelectorAll('source').forEach(source => {
                     let src = source.getAttribute('srcset') || source.getAttribute('src');
                     if (!src) return;
                     
-                    // take just the first part of srcset if it has multiple
                     src = src.split(' ')[0];
-                    if (src.startsWith('data:image') || src.startsWith('blob:')) {
-                        return;
-                    }
+                    if (src.startsWith('data:') || src.startsWith('blob:')) return;
+                    
+                    try { src = new URL(src, window.location.href).href; } catch(e) { return; }
                     
                     results.push({
                         tag: '<source>',
                         src: src,
                         alt: null,
-                        displayedWidth: 0, // cannot reliably determine without matching img
+                        displayedWidth: 0,
                         displayedHeight: 0,
                         originalWidth: 0,
                         originalHeight: 0,
@@ -209,7 +166,7 @@ def extract_image_data(url: str):
                     
                 parsed_url = str(src).lower()
                 
-                # Try to get extension
+                # Get extension and filename
                 ext = ""
                 file_name = ""
                 try:
@@ -219,12 +176,10 @@ def extract_image_data(url: str):
                 except:
                     pass
                 
-                # Check if it's one of allowed
+                # Verify allowed extension
                 if ext not in allowed_exts:
-                    # Also check if the URL contains .png etc. as a fallback
                     if not any(a_ext in parsed_url for a_ext in allowed_exts):
                         continue
-                    # Re-assign best guess ext
                     for a_ext in allowed_exts:
                         if a_ext in parsed_url:
                             ext = a_ext
@@ -238,11 +193,11 @@ def extract_image_data(url: str):
                 elif ext in [".jpg", ".jpeg"]:
                     results["jpeg"] += 1
                 
-                # Compute difference
-                nw = img['originalWidth']
-                nh = img['originalHeight']
+                # Compute display difference
                 w = img['displayedWidth']
                 h = img['displayedHeight']
+                nw = img['originalWidth']
+                nh = img['originalHeight']
                 
                 w_diff = 0
                 h_diff = 0
@@ -256,17 +211,15 @@ def extract_image_data(url: str):
                 img['displayDifference'] = display_diff_str
                 img['extension'] = ext
                 img['fileName'] = file_name
-                
                 img['duplicate'] = src in seen_urls
                 seen_urls.add(src)
                 
                 img['missingAlt'] = img['alt'] is None
                 img['zeroDimensions'] = (w == 0 and h == 0)
-                
                 img['upscaled'] = (w > nw and nw > 0) or (h > nh and nh > 0)
                 img['downscaled'] = (w < nw and w > 0) or (h < nh and h > 0)
-                
                 img['src'] = src
+                
                 processed_images.append(img)
                 
             results["images"] = processed_images

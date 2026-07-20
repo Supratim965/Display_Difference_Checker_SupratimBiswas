@@ -15,15 +15,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const jpegCount    = document.getElementById('jpegCount');
     const downloadBtn  = document.getElementById('downloadBtn');
 
-    // Progress stage messages shown while polling
     const progressStages = [
-        { main: "Launching Browser...",      sub: "Setting up headless environment" },
-        { main: "Opening Website...",         sub: "Navigating to the provided URL" },
-        { main: "Scanning Images...",         sub: "Finding all image tags and sources" },
-        { main: "Calculating Dimensions...",  sub: "Comparing original vs display sizes" },
-        { main: "Generating Excel...",        sub: "Creating your professional report" },
-        { main: "Still working...",           sub: "Some pages take a little longer — please wait" },
-        { main: "Almost there...",            sub: "Finalizing your report" }
+        { main: "Waking up server...",        sub: "Free tier server is starting, please hold on" },
+        { main: "Launching Browser...",        sub: "Setting up headless Chromium environment" },
+        { main: "Opening Website...",          sub: "Navigating to the provided URL" },
+        { main: "Scanning Images...",          sub: "Finding all image tags and sources" },
+        { main: "Calculating Dimensions...",   sub: "Comparing original vs displayed sizes" },
+        { main: "Generating Excel...",         sub: "Creating your professional report" },
+        { main: "Still working...",            sub: "Some pages take a little longer — please wait" },
+        { main: "Almost there...",             sub: "Finalizing your report" }
     ];
 
     let progressInterval = null;
@@ -38,21 +38,14 @@ document.addEventListener('DOMContentLoaded', () => {
         progressSubtext.textContent = progressStages[0].sub;
 
         progressInterval = setInterval(() => {
-            stage++;
-            if (stage < progressStages.length) {
-                progressText.textContent    = progressStages[stage].main;
-                progressSubtext.textContent = progressStages[stage].sub;
-            }
-            // After the last stage just stop cycling — don't clear the interval
-            // so the last message stays visible.
-        }, 5000);
+            stage = Math.min(stage + 1, progressStages.length - 1);
+            progressText.textContent    = progressStages[stage].main;
+            progressSubtext.textContent = progressStages[stage].sub;
+        }, 6000);
     };
 
     const stopProgressSimulation = () => {
-        if (progressInterval) {
-            clearInterval(progressInterval);
-            progressInterval = null;
-        }
+        if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
     };
 
     // -----------------------------------------------------------------------
@@ -79,31 +72,70 @@ document.addEventListener('DOMContentLoaded', () => {
         resultsCard.classList.remove('d-none');
         analyzeBtn.disabled = false;
         urlInput.disabled   = false;
-
         totalImages.textContent = data.totalImages;
         pngCount.textContent    = data.png;
         svgCount.textContent    = data.svg;
         jpegCount.textContent   = data.jpeg;
-
         downloadBtn.href = '/' + data.excel;
+    };
+
+    // -----------------------------------------------------------------------
+    // Fetch with timeout helper (ms)
+    // -----------------------------------------------------------------------
+    const fetchWithTimeout = async (url, options = {}, timeoutMs = 120000) => {
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(url, { ...options, signal: controller.signal });
+            clearTimeout(id);
+            return response;
+        } catch (err) {
+            clearTimeout(id);
+            throw err;
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // POST /analyze with automatic retry (handles cold-start sleeps)
+    // -----------------------------------------------------------------------
+    const postAnalyze = async (urls, maxRetries = 3) => {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const response = await fetchWithTimeout('/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ urls })
+                }, 120000); // 2-minute timeout per attempt
+
+                return response;
+            } catch (err) {
+                console.warn(`Attempt ${attempt}/${maxRetries} failed:`, err.message);
+                if (attempt < maxRetries) {
+                    // Update UI to let user know we're retrying
+                    progressText.textContent    = `Server waking up... (retry ${attempt}/${maxRetries - 1})`;
+                    progressSubtext.textContent = 'Free tier servers sleep when idle — please wait';
+                    await new Promise(r => setTimeout(r, 3000)); // wait 3s before retry
+                } else {
+                    throw err; // all retries exhausted
+                }
+            }
+        }
     };
 
     // -----------------------------------------------------------------------
     // Polling logic
     // -----------------------------------------------------------------------
     const pollJobStatus = (jobId) => {
-        // Poll every 4 seconds
+        let consecutiveFailures = 0;
+
         pollTimer = setInterval(async () => {
             try {
-                const res  = await fetch(`/status/${jobId}`);
+                const res  = await fetchWithTimeout(`/status/${jobId}`, {}, 30000);
                 const data = await res.json();
+                consecutiveFailures = 0;
 
-                if (data.status === 'pending') {
-                    // Still running — keep polling
-                    return;
-                }
+                if (data.status === 'pending') return; // still running
 
-                // Terminal state — stop polling
                 clearInterval(pollTimer);
                 pollTimer = null;
                 stopProgressSimulation();
@@ -111,13 +143,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (data.status === 'done') {
                     showSuccess(data);
                 } else {
-                    // status === 'error'
                     showError(data.message || 'An error occurred during analysis.');
                 }
-
             } catch (err) {
-                // Network blip on the status check — keep retrying, do NOT surface error yet
-                console.warn('Status poll failed, will retry:', err);
+                consecutiveFailures++;
+                console.warn(`Poll attempt failed (${consecutiveFailures}):`, err.message);
+
+                // After 10 consecutive poll failures (~40s) give up
+                if (consecutiveFailures >= 10) {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    stopProgressSimulation();
+                    showError('Server is not responding. Please try again.');
+                }
             }
         }, 4000);
     };
@@ -134,25 +172,15 @@ document.addEventListener('DOMContentLoaded', () => {
         const urls = urlText.split('\n').map(u => u.trim()).filter(u => u.length > 0);
         if (urls.length === 0) return;
 
-        // Clear any previous poll
-        if (pollTimer) {
-            clearInterval(pollTimer);
-            pollTimer = null;
-        }
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         stopProgressSimulation();
 
         resetUI();
         startProgressSimulation();
 
         try {
-            // This request returns almost immediately with a job_id
-            const response = await fetch('/analyze', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ urls })
-            });
-
-            const data = await response.json();
+            const response = await postAnalyze(urls);
+            const data     = await response.json();
 
             if (!response.ok || data.status === 'error') {
                 stopProgressSimulation();
@@ -160,13 +188,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            // Start polling for the result
+            // Kick off status polling
             pollJobStatus(data.job_id);
 
         } catch (error) {
             console.error('Submit error:', error);
             stopProgressSimulation();
-            showError('Could not reach the server. Please check your connection and try again.');
+            showError('Server could not be reached after multiple attempts. Please try again in a moment.');
         }
     });
 });
